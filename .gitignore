@@ -1,0 +1,11 @@
+# Build and staging artifacts
+.build/
+*.tar.gz
+*.tar.gz.sha256
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# OS files
+.DS_Store

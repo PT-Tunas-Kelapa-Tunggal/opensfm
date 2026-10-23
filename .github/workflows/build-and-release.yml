@@ -1,0 +1,151 @@
+name: Build & Package OpenSfM Engine (macOS arm64)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Upstream OpenSfM Tag or Commit SHA'
+        required: true
+        default: 'v1.1'
+      version_tag:
+        description: 'Release Tag Name (e.g. v1.1)'
+        required: true
+        default: 'v1.1'
+      draft:
+        description: 'Publish as Draft Release'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-package:
+    name: Build & Release Engine
+    runs-on: macos-14 # Apple Silicon M1 Runner
+
+    steps:
+      - name: Checkout Packaging Repository
+        uses: actions/checkout@v4
+
+      - name: Determine Target Version & Ref
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ github.event.inputs.version_tag }}"
+            REF="${{ github.event.inputs.upstream_ref }}"
+          else
+            TAG="${GITHUB_REF#refs/tags/}"
+            REF="$TAG"
+          fi
+          echo "TAG=$TAG" >> $GITHUB_OUTPUT
+          echo "REF=$REF" >> $GITHUB_OUTPUT
+          echo "Target Release Tag: $TAG"
+          echo "Upstream Git Ref:   $REF"
+
+      - name: Check if Release Already Exists
+        id: check_release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.vars.outputs.TAG }}" >/dev/null 2>&1; then
+            echo "Release ${{ steps.vars.outputs.TAG }} already exists. Skipping build."
+            echo "EXISTS=true" >> $GITHUB_OUTPUT
+          else
+            echo "EXISTS=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup Micromamba Environment
+        if: steps.check_release.outputs.EXISTS == 'false'
+        uses: mamba-org/setup-micromamba@v1
+        with:
+          environment-file: Config/conda-osx-arm64.lock
+          environment-name: opensfm-build-env
+          cache-environment: true
+
+      - name: Clone Upstream OpenSfM & Resolve Commit SHA
+        id: git_info
+        if: steps.check_release.outputs.EXISTS == 'false'
+        run: |
+          mkdir -p .build
+          git clone --no-checkout https://github.com/OpenSfM/OpenSfM.git .build/OpenSfM
+          git -C .build/OpenSfM checkout --detach "${{ steps.vars.outputs.REF }}"
+          git -C .build/OpenSfM submodule update --init --recursive
+          
+          # Resolve and export the exact Git commit SHA
+          COMMIT="$(git -C .build/OpenSfM rev-parse HEAD)"
+          echo "COMMIT=$COMMIT" >> $GITHUB_OUTPUT
+          echo "Target ref '${{ steps.vars.outputs.REF }}' resolved to commit: $COMMIT"
+
+      - name: Install Runtime Wheels & Compile OpenSfM C++ Bindings
+        if: steps.check_release.outputs.EXISTS == 'false'
+        run: |
+          PREFIX="$MAMBA_ROOT_PREFIX/envs/opensfm-build-env"
+          
+          # 1. Install pinned pip packages with strict checksums
+          micromamba run -n opensfm-build-env python -m pip --isolated install \
+            --index-url https://pypi.org/simple --no-deps --only-binary=:all: --require-hashes \
+            -r Config/requirements-runtime.lock \
+            -r Config/requirements-build.lock
+          
+          # 2. Compile OpenSfM C++ core with Clang and OpenMP
+          export PYTHONNOUSERSITE=1
+          export CMAKE_BUILD_PARALLEL_LEVEL=3
+          micromamba run -n opensfm-build-env /usr/bin/env \
+            CC=/usr/bin/clang CXX=/usr/bin/clang++ LD=/usr/bin/ld \
+            CFLAGS="-O2 -fPIC -I$PREFIX/include" \
+            CXXFLAGS="-O2 -fPIC -stdlib=libc++ -I$PREFIX/include" \
+            LDFLAGS="-L$PREFIX/lib -Wl,-rpath,$PREFIX/lib -fuse-ld=/usr/bin/ld" \
+            CMAKE_ARGS="-DCMAKE_C_COMPILER=/usr/bin/clang -DCMAKE_CXX_COMPILER=/usr/bin/clang++ -DCMAKE_LINKER=/usr/bin/ld -DCMAKE_AR=/usr/bin/ar -DCMAKE_RANLIB=/usr/bin/ranlib -DCMAKE_PREFIX_PATH=$PREFIX -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0" \
+            python -m pip --isolated install --no-deps --no-build-isolation -e .build/OpenSfM
+
+      - name: Relink Mach-O Binaries & Prune Development Headers
+        if: steps.check_release.outputs.EXISTS == 'false'
+        run: |
+          PREFIX="$MAMBA_ROOT_PREFIX/envs/opensfm-build-env"
+          python3 Scripts/prepare-distribution-engine.py \
+            --runtime "$PREFIX" \
+            --opensfm .build/OpenSfM \
+            --version "${{ steps.vars.outputs.TAG }}" \
+            --commit "${{ steps.git_info.outputs.COMMIT }}" \
+            --output .build/dist \
+            --adhoc
+
+      - name: Compress Engine Archive
+        if: steps.check_release.outputs.EXISTS == 'false'
+        run: |
+          cd .build/dist
+          tar -czf ../../OrthomosaicEngine-macOS-arm64.tar.gz OrthomosaicEngine OrthomosaicPython
+          cd ../..
+          shasum -a 256 OrthomosaicEngine-macOS-arm64.tar.gz > OrthomosaicEngine-macOS-arm64.tar.gz.sha256
+          
+          echo "Archive size: $(du -sh OrthomosaicEngine-macOS-arm64.tar.gz | awk '{print $1}')"
+          echo "SHA256: $(cat OrthomosaicEngine-macOS-arm64.tar.gz.sha256)"
+
+      - name: Create GitHub Release
+        if: steps.check_release.outputs.EXISTS == 'false'
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.vars.outputs.TAG }}
+          name: "OpenSfM macOS arm64 Runtime ${{ steps.vars.outputs.TAG }}"
+          body: |
+            ## OpenSfM Pre-compiled Engine for macOS Apple Silicon
+            - **Release Version**: `${{ steps.vars.outputs.TAG }}`
+            - **OpenSfM Upstream Commit SHA**: `${{ steps.git_info.outputs.COMMIT }}`
+            - **Architecture**: `macOS arm64` (Apple Silicon M1/M2/M3/M4)
+            - **Deployment Target**: `macOS 14.0+`
+            - **SHA-256 Checksum**: `$(cat OrthomosaicEngine-macOS-arm64.tar.gz.sha256 | awk '{print $1}')`
+          draft: ${{ github.event.inputs.draft || false }}
+          prerelease: false
+          files: |
+            OrthomosaicEngine-macOS-arm64.tar.gz
+            OrthomosaicEngine-macOS-arm64.tar.gz.sha256

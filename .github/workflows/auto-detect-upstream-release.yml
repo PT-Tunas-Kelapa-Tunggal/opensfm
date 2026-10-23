@@ -49,18 +49,8 @@ jobs:
               continue
             fi
 
-            # Check if tag is strictly higher than MIN_VERSION using semver comparison
-            IS_HIGHER=$(python3 -c '
-import sys, re
-
-def parse_v(v):
-    nums = re.findall(r"\d+", v)
-    return tuple(int(x) for x in nums) if nums else (0,)
-
-min_v = parse_v(sys.argv[1])
-cand_v = parse_v(sys.argv[2])
-print("true" if cand_v >= min_v else "false")
-' "$MIN_VERSION" "$tag")
+            # Check if tag is at least MIN_VERSION using semver comparison
+            IS_HIGHER=$(python3 -c "import sys, re; parse = lambda v: tuple(map(int, re.findall(r'\d+', v))) if re.findall(r'\d+', v) else (0,); print('true' if parse(sys.argv[2]) >= parse(sys.argv[1]) else 'false')" "$MIN_VERSION" "$tag")
 
             if [ "$IS_HIGHER" = "true" ]; then
               echo ">>> Candidate tag $tag meets/exceeds threshold $MIN_VERSION. Queuing build."
